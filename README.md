@@ -3,8 +3,12 @@
 Read an NCC `.tar.gz` in place and write two Parquet files whose columns follow the Panacea ClickHouse tables. The archive is not extracted, and nothing is inserted into ClickHouse.
 
 ```bash
+python3 -m pip install -r requirements.txt
 python3 bundle_to_parquet.py /path/to/NCC-logs.tar.gz
+python3 duckdb_search.py /path/to/the/parquet/directory
 ```
+
+`requirements.txt` installs PyArrow, which writes the files, and DuckDB, which searches them. `duckdb_search.py` runs the log hour filter, the level count, the message word search, and the SAR metric filter. Its defaults are the case 2734579 queries below.
 
 | Output | Panacea table | Contents |
 |---|---|---|
@@ -46,7 +50,11 @@ A search for a word inside `message` does not skip blocks. A block only records 
 
 ## DuckDB search
 
-DuckDB 1.5.6 queried the two files directly. Nothing was loaded into a database, and ClickHouse was not used. Both structured filters finished in about 0.02 seconds. The word search took 0.33 seconds because it reads message text.
+`duckdb_search.py` runs these queries. DuckDB 1.5.6 read the two files directly. Nothing was loaded into a database, and ClickHouse was not used. Both structured filters finished in about 0.02 seconds. The word search took 0.33 seconds because it reads message text.
+
+```bash
+python3 duckdb_search.py /path/to/the/parquet/directory
+```
 
 Logs, one CVM, one file, one hour:
 
