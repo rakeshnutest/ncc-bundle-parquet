@@ -32,9 +32,59 @@ Each file is rewritten once after parsing. Rows are stored in groups of 16,384 w
 | `nu_logs_local.parquet` | `filename`, `cvm_ip`, `event_time`, `log_level` |
 | `nu_metrics_sysstats.parquet` | `cvm_ip`, `component`, `metric_name`, `component_instance`, `event_timestamp` |
 
-A filter on those columns skips row groups whose min/max cannot match. `cvm_ip` is in the log sort as well as the metrics sort, because a single bundle is one `log_bundle_id` and the useful cut is file, then CVM, then time. A word inside `message` still reads that column; Parquet stats do not describe tokens.
-
 The code is split so the parsers do not each own a writer. `nccparquet/archive.py` walks the tar and nested zips in memory. `nccparquet/logs.py` and `nccparquet/sar.py` parse. `nccparquet/layout.py` writes the sorted files. `bundle_to_parquet.py` is the command.
+
+## How filtering works
+
+There is no separate search index. Each file is cut into blocks of 16,384 rows, and each block stores the smallest and largest value of its columns. DuckDB, or any other Parquet reader, skips a block when those two values cannot match the question.
+
+Logs are ordered by the full filename (`messages.1`, then `messages.2`), then the CVM, then the time, then the level. One rotated file on one CVM sits in its own stretch of blocks, in time order. A question for that file, that CVM, and one hour opens only the blocks whose time range covers that hour. On this bundle that hour overlaps 6 of 273 log blocks.
+
+SAR is ordered by the CVM, then the component, then the metric name, then the instance, then the time. All of one metric for one CVM is together. A question for `sar_rx_packets_per_sec` on one CVM overlaps 7 of 332 SAR blocks.
+
+A search for a word inside `message` does not skip blocks. A block only records the first and last message in sorted order, which does not say whether a word appears in the middle. That search reads the message column.
+
+## DuckDB search
+
+DuckDB 1.5.6 queried the two files directly. Nothing was loaded into a database, and ClickHouse was not used. Both structured filters finished in about 0.02 seconds. The word search took 0.33 seconds because it reads message text.
+
+Logs, one CVM, one file, one hour:
+
+```sql
+SELECT event_time, filename, log_level, source_log_filename, message
+FROM read_parquet('nu_logs_local.parquet')
+WHERE cvm_ip = '172.17.0.219'
+  AND filename_without_ext = 'messages'
+  AND event_time >= TIMESTAMPTZ '2026-10-14 08:00:00+00'
+  AND event_time <  TIMESTAMPTZ '2026-10-14 09:00:00+00'
+ORDER BY event_time;
+```
+
+This returned **6,645** rows, all level `I`, all from `messages.1`. The first lines are an iptables drop on `eth0` and `systemd` starting a root session. Adding `log_level = 'E'` returned **0** rows. That hour has no error lines in `messages`.
+
+An error line does exist elsewhere. The latest one is in `logbayd.log.20261013-140728Z` on `172.17.0.220` at 2026-10-14 21:59:13 UTC, from `file_util.go`. Searching that file for the word `ERROR` returned **11** rows:
+
+```sql
+SELECT event_time, message
+FROM read_parquet('nu_logs_local.parquet')
+WHERE cvm_ip = '172.17.0.220'
+  AND filename = 'logbayd.log.20261013-140728Z'
+  AND contains(message, 'ERROR');
+```
+
+SAR, same CVM and hour, one metric:
+
+```sql
+SELECT event_timestamp, component_instance, value, unit
+FROM read_parquet('nu_metrics_sysstats.parquet')
+WHERE cvm_ip = '172.17.0.219'
+  AND metric_name = 'sar_rx_packets_per_sec'
+  AND event_timestamp >= TIMESTAMPTZ '2026-10-14 08:00:00+00'
+  AND event_timestamp <  TIMESTAMPTZ '2026-10-14 09:00:00+00'
+ORDER BY event_timestamp, component_instance;
+```
+
+This returned **24** samples across `eth0`, `eth1`, `eth2`, and `lo`. At 08:00, `eth0` was 1,381.71 packets/sec and `eth2` was 0.
 
 ## What one bundle measured
 
@@ -59,7 +109,7 @@ Advantages
 
 - One bundle becomes a pair of files. No ClickHouse cluster, disk quota, or ingest worker is required.
 - The NCC tar stays packed. Useful when the bundle must not be exploded on disk.
-- About 16x smaller than the unpacked text that was parsed. Enough to keep a bundle next to the tar.
+- About 21 times smaller than the unpacked text that was parsed. Enough to keep a bundle next to the tar.
 - Portable. PyArrow, DuckDB, or `clickhouse-local` can query the files without the Panacea service.
 - No 30-day TTL. The file lasts as long as you keep it.
 - Safe against the production Panacea ClickHouse: this tool never connects to it.
