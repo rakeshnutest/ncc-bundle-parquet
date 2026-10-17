@@ -107,6 +107,18 @@ Diamond case `2734579`, alert `A130087`, collected 2026-10-14. Four CVM alert zi
 
 Parquet is about 21 times smaller than the unpacked log and SAR text, and 44 MiB under the already-compressed tar. Dictionary pages on the log text and plain ZSTD on SAR values brought the pair down from 53.2 MiB to 39.6 MiB. ClickHouse would land in the same range for this bundle. The tar still holds about 230 MiB of unpacked files that these Parquet files do not include (`sar` binaries, `nodetool`, and other non-log members).
 
+## How the compression was achieved
+
+The compressor on every column is still ZSTD, at level 3. The drop from 53.2 MiB to 39.6 MiB comes from encoding each column before ZSTD runs, and from sorting so similar values sit next to each other.
+
+Dictionary. A repeated value is stored once and each row keeps a small id. Log `message` and `log_hash` use this, along with the short names (`cvm_ip`, filename, `metric_name`, `log_level`). With the dictionary off, `message` grew from 18.7 MiB to 20.0 MiB and `log_hash` from 0.18 MiB to 0.39 MiB. With it on, `log_hash` is 0.17 MiB and `message` is 19.1 MiB.
+
+Delta. A timestamp column stores the first value, then the gap to the next one. After the rows are sorted by time those gaps are small. Log `event_time` fell from 8.8 MiB to 2.4 MiB. SAR `event_timestamp` uses the same encoding. Writing that SAR column as plain numbers made it 4.5 MiB, so the delta encoding stayed.
+
+Sort, then plain ZSTD, for the SAR numbers. `value` is a normal float column. Grouping one metric's samples together made neighboring numbers similar, and ZSTD compressed that run from 10.1 MiB to 6.9 MiB. The same sort put the repeated prefix of `unique_identifier` (`cvm|file|time|instance|metric`) on adjacent rows, and that column fell from 11.4 MiB to 5.6 MiB.
+
+Byte-stream split was tried on `value` and removed. It splits each float into eight byte streams, which is the Parquet stand-in for ClickHouse Gorilla. These blocks hold several metrics at once, the scales jump, and `value` grew to 12.7 MiB. Plain ZSTD was smaller, so that is what the file uses.
+
 ## Parquet and ClickHouse in Panacea
 
 Both layouts use the same column names, so a later load is `INSERT INTO panacea.nu_logs_local SELECT * FROM file('nu_logs_local.parquet', Parquet)` (and the same for `nu_metrics_sysstats`). The difference is what Panacea can do with the data after that.
