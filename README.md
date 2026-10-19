@@ -5,10 +5,22 @@ Read an NCC `.tar.gz` in place and write two Parquet files whose columns follow 
 ```bash
 python3 -m pip install -r requirements.txt
 python3 bundle_to_parquet.py /path/to/NCC-logs.tar.gz
+python3 bundle_to_parquet.py --tar-list tars.txt --out-dir /path/to/the/bundle
+python3 bundle_to_parquet.py /path/to/another.tar.gz --out-dir /path/to/the/bundle
 python3 duckdb_search.py /path/to/the/parquet/directory
 ```
 
 `requirements.txt` installs PyArrow, which writes the files, and DuckDB, which searches them. `duckdb_search.py` runs the log hour filter, the level count, the message word search, and the SAR metric filter. Its defaults are the case 2734579 queries below.
+
+`--jobs` parses that many files at once. The default is one worker per CPU. Duplicate lines are still dropped in the parent before they are written. On this case, 8 workers finished logs and SAR in 148 seconds. One worker took 259 seconds and wrote the same rows.
+
+Pass every tar from the same case on the command line, or put one path per line in a file and pass `--tar-list`. A line is checked before it is written. The same line on the same node, in the same file stem, at the same timestamp, is stored once. A second copy is skipped, whether it is later in the same tar or in another tar. SAR samples use the same rule on node, sar file, timestamp, instance, and metric.
+
+When the Parquet files are already in `--out-dir`, a later run appends the new tar to them. Lines already in the file are not written again. The run prints `existing`, `added`, and `skipped_duplicates`.
+
+`ingested_bundles.json` in the output directory records each tar by its sha256. Passing that same tar again prints `skip ingested` and does not read it. A different tar is still ingested, and a line it shares with an earlier tar is still dropped.
+
+`--diamond` is off unless you pass it. With that flag the two Parquet files are copied to `/users/<user>/shared/ncc-bundle-parquet/<id>/` on Diamond, the same shared home Panacea uses for reports. The case directory under `/mnt/data_vol` is not writable. DuckDB does not read that Diamond URL: the web path redirects to Okta. Copy the file back, or point `duckdb_search.py` at the local `--out-dir`.
 
 | Output | Panacea table | Contents |
 |---|---|---|

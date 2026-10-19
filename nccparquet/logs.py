@@ -3,17 +3,21 @@
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from nccparquet.archive import IP_RE, cvm_ip_from, iter_members, iter_text_lines
+from nccparquet.dedup import IngestSeen, log_key
 from nccparquet.layout import (
     LOG_DICTIONARY,
     LOG_ENCODING,
     LOG_SORT,
     ColumnWriter,
-    rewrite_sorted,
+    write_sorted,
 )
+from nccparquet.parallel import map_unordered
 
 MSG_CAP = 262144
 
@@ -337,7 +341,7 @@ def parse_header(line, collected):
     return None
 
 
-def _add(writer, rec, filename, cvm_ip, log_bundle_id, created):
+def _add(writer, rec, filename, cvm_ip, log_bundle_id, created, seen):
     if rec["event_time"] is None:
         return False
     base = filename.rsplit("/", 1)[-1]
@@ -347,6 +351,8 @@ def _add(writer, rec, filename, cvm_ip, log_bundle_id, created):
     line_no = rec["line_number"]
     message = rec["message"][:MSG_CAP]
     ip = cvm_ip if IP_RE.fullmatch(cvm_ip or "") else "0.0.0.0"
+    if not seen.accept(log_key(cvm_ip or "0.0.0.0", wo, rec["event_time"], level, rec["pid"] & 0xFFFFFFFF, source, message)):
+        return False
     writer.add_row(
         {
             "log_bundle_id": log_bundle_id,
@@ -378,14 +384,14 @@ def _add(writer, rec, filename, cvm_ip, log_bundle_id, created):
     return True
 
 
-def consume(lines, member_name, writer, log_bundle_id, collected, created):
+def consume(lines, member_name, writer, log_bundle_id, collected, created, seen):
     cvm = cvm_ip_from(member_name)
     current = None
     emitted = 0
     for line in lines:
         header = parse_header(line, collected)
         if header:
-            if current is not None and _add(writer, current, member_name, cvm, log_bundle_id, created):
+            if current is not None and _add(writer, current, member_name, cvm, log_bundle_id, created, seen):
                 emitted += 1
             current = header
             continue
@@ -393,28 +399,125 @@ def consume(lines, member_name, writer, log_bundle_id, collected, created):
             room = MSG_CAP - len(current["message"])
             if room > 0:
                 current["message"] += ("\n" + line)[:room]
-    if current is not None and _add(writer, current, member_name, cvm, log_bundle_id, created):
+    if current is not None and _add(writer, current, member_name, cvm, log_bundle_id, created, seen):
         emitted += 1
     if emitted:
         writer.files += 1
-        print(f"{emitted:8}  {member_name}", flush=True)
 
 
-def run_logs(bundle, out, log_bundle_id, collected):
-    created = datetime.now(timezone.utc).replace(microsecond=0)
-    writer = ColumnWriter(out, SCHEMA)
-    for name, raw in iter_members(bundle):
-        if not want_member(name):
-            continue
-        consume(
-            iter_text_lines(raw),
-            name,
-            writer,
-            log_bundle_id,
-            collected,
-            created,
+def _existing_logs(path, seen):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    table = pq.read_table(path)
+    columns = {
+        name: table.column(name).to_pylist()
+        for name in (
+            "cvm_ip",
+            "filename_without_ext",
+            "event_time",
+            "log_level",
+            "pid",
+            "source_log_filename",
+            "message",
         )
+    }
+    for i in range(table.num_rows):
+        event_time = columns["event_time"][i]
+        if event_time is None:
+            continue
+        seen.done.add(
+            log_key(
+                columns["cvm_ip"][i],
+                columns["filename_without_ext"][i],
+                event_time,
+                columns["log_level"][i],
+                columns["pid"][i],
+                columns["source_log_filename"][i],
+                columns["message"][i],
+            )
+        )
+    print(f"existing logs {table.num_rows}")
+    return table
+
+
+class _ListWriter:
+    def __init__(self):
+        self.rows = []
+        self.files = 0
+
+    def add_row(self, row):
+        self.rows.append(row)
+
+
+def parse_log_member(name, raw, log_bundle_id, collected, created):
+    """Parse one archive member. Safe to run in a worker process."""
+    writer = _ListWriter()
+    seen = IngestSeen()
+    consume(iter_text_lines(raw), name, writer, log_bundle_id, collected, created, seen)
+    return name, writer.rows, seen.skipped, writer.files
+
+
+def _log_members(bundles, collected):
+    for bundle in bundles:
+        bundle_collected = collected.get(bundle) if isinstance(collected, dict) else collected
+        for name, raw in iter_members(bundle):
+            if want_member(name):
+                yield name, raw, bundle_collected
+
+
+def run_logs(bundles, out, log_bundle_id, collected, jobs=1):
+    if isinstance(bundles, (str, bytes)) or not isinstance(bundles, (list, tuple)):
+        bundles = [bundles]
+    out = Path(out)
+    created = datetime.now(timezone.utc).replace(microsecond=0)
+    seen = IngestSeen()
+    existing = _existing_logs(out, seen)
+    incoming = out.with_suffix(".incoming.parquet")
+    writer = ColumnWriter(incoming, SCHEMA)
+
+    def on_result(result):
+        name, rows, skipped, files = result
+        seen.skipped += skipped
+        kept = 0
+        for row in rows:
+            key = log_key(
+                row["cvm_ip"],
+                row["filename_without_ext"],
+                row["event_time"],
+                row["log_level"],
+                row["pid"],
+                row["source_log_filename"],
+                row["message"],
+            )
+            if not seen.accept(key):
+                continue
+            writer.add_row(row)
+            kept += 1
+        if files:
+            writer.files += files
+            print(f"{kept:8}  {name}", flush=True)
+
+    map_unordered(
+        jobs,
+        (
+            (name, raw, log_bundle_id, bundle_collected, created)
+            for name, raw, bundle_collected in _log_members(bundles, collected)
+        ),
+        parse_log_member,
+        on_result,
+    )
+    seen.finish_bundle()
     writer.close()
-    meta = rewrite_sorted(out, LOG_SORT, LOG_DICTIONARY, LOG_ENCODING)
-    print(f"rows {meta.num_rows} files {writer.files} parquet {out} bytes {out.stat().st_size}")
+    added = pq.read_table(incoming)
+    incoming.unlink()
+    if existing is not None and existing.num_rows:
+        table = pa.concat_tables([existing, added], promote_options="default")
+    else:
+        table = added
+    meta = write_sorted(table, out, LOG_SORT, LOG_DICTIONARY, LOG_ENCODING)
+    print(
+        f"rows {meta.num_rows} files {writer.files} added {added.num_rows} "
+        f"skipped_duplicates {seen.skipped} parquet {out} bytes {out.stat().st_size}"
+    )
     return meta.num_rows

@@ -3,17 +3,21 @@
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from nccparquet.archive import cvm_ip_from, iter_members
+from nccparquet.dedup import IngestSeen, sar_key
 from nccparquet.layout import (
     METRIC_DICTIONARY,
     METRIC_ENCODING,
     METRIC_SORT,
     ColumnWriter,
-    rewrite_sorted,
+    write_sorted,
 )
+from nccparquet.parallel import map_unordered
 
 LINUX_RE = re.compile(r"^Linux\s+.+\((?P<host>[^)]+)\)\s+(?P<date>\d{4}-\d{2}-\d{2})")
 SAR_NAME = re.compile(r"sar\d+$")
@@ -152,7 +156,7 @@ def tags_for(component, instance, cache):
     return cached
 
 
-def ingest_text(text, member_name, cvm_ip, writer, log_bundle_id, created, tag_cache):
+def ingest_text(text, member_name, cvm_ip, writer, log_bundle_id, created, tag_cache, seen):
     source = member_name.rsplit("/", 1)[-1]
     day = None
     section = None
@@ -196,6 +200,9 @@ def ingest_text(text, member_name, cvm_ip, writer, log_bundle_id, created, tag_c
                 metric_name, unit = explicit
             else:
                 metric_name, unit = norm_metric(column), unit_of(column, "")
+            unique_identifier = f"{cvm_ip}|{source}|{stamp_iso}|{instance}|{metric_name}"
+            if not seen.accept(sar_key(unique_identifier)):
+                continue
             writer.add_row(
                 {
                     "log_bundle_id": log_bundle_id,
@@ -208,7 +215,7 @@ def ingest_text(text, member_name, cvm_ip, writer, log_bundle_id, created, tag_c
                     "unit": unit,
                     "tags": tags,
                     "source_file": source,
-                    "unique_identifier": f"{cvm_ip}|{source}|{stamp_iso}|{instance}|{metric_name}",
+                    "unique_identifier": unique_identifier,
                     "batch_id": 0,
                     "created_at": created,
                 }
@@ -216,30 +223,98 @@ def ingest_text(text, member_name, cvm_ip, writer, log_bundle_id, created, tag_c
             emitted += 1
     if emitted:
         writer.files += 1
-        print(f"{emitted:8}  {member_name}", flush=True)
 
 
-def run(bundle, out, log_bundle_id):
+def _existing_sar(path, seen):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    table = pq.read_table(path)
+    for item in table.column("unique_identifier").to_pylist():
+        seen.done.add(sar_key(item))
+    print(f"existing sar {table.num_rows}")
+    return table
+
+
+def parse_sar_member(name, raw, log_bundle_id, created):
+    """Parse one sarNN report. Safe to run in a worker process."""
+    if b"\x00" in raw[:512] or not raw.startswith(b"Linux "):
+        return name, [], 0, 0, True
+    rows = []
+
+    class _Rows:
+        def __init__(self):
+            self.files = 0
+
+        def add_row(self, row):
+            rows.append(row)
+
+    seen = IngestSeen()
+    writer = _Rows()
+    ingest_text(
+        raw.decode("utf-8", "replace"),
+        name,
+        cvm_ip_from(name),
+        writer,
+        log_bundle_id,
+        created,
+        {},
+        seen,
+    )
+    return name, rows, seen.skipped, writer.files, False
+
+
+def _sar_members(bundles):
+    for bundle in bundles:
+        for name, raw in iter_members(bundle):
+            base = name.rsplit("/", 1)[-1]
+            if SAR_NAME.match(base):
+                yield name, raw
+
+
+def run(bundles, out, log_bundle_id, jobs=1):
+    if isinstance(bundles, (str, bytes)) or not isinstance(bundles, (list, tuple)):
+        bundles = [bundles]
+    out = Path(out)
     created = datetime.now(timezone.utc).replace(microsecond=0)
-    writer = ColumnWriter(out, SCHEMA)
-    tag_cache = {}
-    for name, raw in iter_members(bundle):
-        base = name.rsplit("/", 1)[-1]
-        if not SAR_NAME.match(base):
-            continue
-        if b"\x00" in raw[:512] or not raw.startswith(b"Linux "):
+    seen = IngestSeen()
+    existing = _existing_sar(out, seen)
+    incoming = out.with_suffix(".incoming.parquet")
+    writer = ColumnWriter(incoming, SCHEMA)
+
+    def on_result(result):
+        name, rows, skipped, files, binary = result
+        if binary:
             print(f"skip non-text {name}", flush=True)
-            continue
-        ingest_text(
-            raw.decode("utf-8", "replace"),
-            name,
-            cvm_ip_from(name),
-            writer,
-            log_bundle_id,
-            created,
-            tag_cache,
-        )
+            return
+        seen.skipped += skipped
+        kept = 0
+        for row in rows:
+            if not seen.accept(sar_key(row["unique_identifier"])):
+                continue
+            writer.add_row(row)
+            kept += 1
+        if files:
+            writer.files += files
+            print(f"{kept:8}  {name}", flush=True)
+
+    map_unordered(
+        jobs,
+        ((name, raw, log_bundle_id, created) for name, raw in _sar_members(bundles)),
+        parse_sar_member,
+        on_result,
+    )
+    seen.finish_bundle()
     writer.close()
-    meta = rewrite_sorted(out, METRIC_SORT, METRIC_DICTIONARY, METRIC_ENCODING)
-    print(f"rows {meta.num_rows} files {writer.files} parquet {out} bytes {out.stat().st_size}")
+    added = pq.read_table(incoming)
+    incoming.unlink()
+    if existing is not None and existing.num_rows:
+        table = pa.concat_tables([existing, added], promote_options="default")
+    else:
+        table = added
+    meta = write_sorted(table, out, METRIC_SORT, METRIC_DICTIONARY, METRIC_ENCODING)
+    print(
+        f"rows {meta.num_rows} files {writer.files} added {added.num_rows} "
+        f"skipped_duplicates {seen.skipped} parquet {out} bytes {out.stat().st_size}"
+    )
     return meta.num_rows

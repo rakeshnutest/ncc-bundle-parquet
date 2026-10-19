@@ -30,6 +30,17 @@ def infer_bundle_id(tar_path):
     return 0
 
 
+def read_tar_paths(list_path):
+    """Read tar paths from a text file, one per line. Blank lines and # comments are ignored."""
+    paths = []
+    for line in Path(list_path).expanduser().read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        paths.append(Path(line))
+    return paths
+
+
 def infer_collected(tar_path):
     match = re.search(r"(\d{2})-(\d{2})-(\d{4})", Path(tar_path).name)
     if not match:

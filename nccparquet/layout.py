@@ -102,9 +102,8 @@ class ColumnWriter:
         self._writer.close()
 
 
-def rewrite_sorted(path, sort_keys, dictionary_columns, column_encoding):
+def write_sorted(table, path, sort_keys, dictionary_columns, column_encoding):
     path = Path(path)
-    table = pq.read_table(path)
     if table.num_rows:
         table = table.sort_by(sort_keys)
     tmp = path.with_suffix(".sorting.parquet")
@@ -122,3 +121,8 @@ def rewrite_sorted(path, sort_keys, dictionary_columns, column_encoding):
     )
     tmp.replace(path)
     return pq.read_metadata(path)
+
+
+def rewrite_sorted(path, sort_keys, dictionary_columns, column_encoding):
+    path = Path(path)
+    return write_sorted(pq.read_table(path), path, sort_keys, dictionary_columns, column_encoding)
